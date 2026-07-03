@@ -65,7 +65,7 @@
   <section id="viewerWrap">
     <div class="panel">
       <b>Mode actuel :</b> annotation fiable des repères par couleur de rack.<br>
-      <span class="hint">Étape suivante : mode “zones murs remplies” avec gabarit de contours sauvegardé.</span>
+      <span class="hint">Correction : détection robuste des repères Cadwork même quand le PDF coupe le texte en petits morceaux.</span>
     </div>
   </section>
 </main>
@@ -82,7 +82,19 @@ let pdfArrayBuffer = null;
 let extractedTags = [];
 
 function normRef(s){return String(s||"").trim().replace(/\s+/g,"").replace(/–|—/g,"-").toUpperCase();}
-function baseRefVariants(ref){const r=normRef(ref);return [r,r.replace(/[ABC]$/,""),r.replace(/A$/,"a").replace(/B$/,"b").replace(/C$/,"c")];}
+function variantKeys(ref){
+  const r=normRef(ref);
+  const v=new Set([r, r.replace(/[ABC]$/,"")]);
+  if(/[ABC]$/.test(r)) v.add(r.slice(0,-1)+r.slice(-1).toLowerCase());
+  return [...v];
+}
+function findRack(ref){
+  for(const k of variantKeys(ref)){
+    if(rackMap.has(k)) return rackMap.get(k);
+    if(rackMap.has(k.toUpperCase())) return rackMap.get(k.toUpperCase());
+  }
+  return null;
+}
 
 function parseTextRackData(text){
   const map = new Map();
@@ -120,6 +132,78 @@ async function parseRackFile(file){
   return parseTextRackData(await file.text());
 }
 
+// Ancienne méthode + nouvelle méthode : si Cadwork coupe les textes, on recompose par lignes.
+async function extractWallRefs(page, viewport, pageNum){
+  const textContent = await page.getTextContent();
+  const direct = [];
+  const chars = [];
+
+  for(const item of textContent.items){
+    const raw = String(item.str || "");
+    const txt = raw.trim();
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const x = tx[4], y = tx[5];
+    const w = item.width ? item.width * viewport.scale : Math.max(3, txt.length*4);
+
+    if(/^E-[A-Z]{1,2}-\d{3}[A-Z]?$/i.test(txt)){
+      direct.push({page:pageNum, ref:normRef(txt), x, y, text:txt});
+    }
+
+    // On conserve aussi les morceaux de texte, même si ce sont des fragments.
+    if(txt){
+      chars.push({s:txt, x, y, w});
+    }
+  }
+
+  if(direct.length) return direct;
+
+  // Recomposition par bandes horizontales. Très utile avec les PDF Cadwork.
+  const rows = [];
+  for(const c of chars){
+    let row = rows.find(r => Math.abs(r.y - c.y) < 6);
+    if(!row){ row = {y:c.y, items:[]}; rows.push(row); }
+    row.items.push(c);
+  }
+
+  const found = [];
+  const seen = new Set();
+  for(const row of rows){
+    row.items.sort((a,b)=>a.x-b.x);
+    const line = row.items.map(i=>i.s).join("");
+    const matches = [...line.matchAll(/E-[A-Z]{1,2}-\d{3}[A-Z]?/gi)];
+    for(const m of matches){
+      const ref = normRef(m[0]);
+      if(seen.has(ref+"@"+Math.round(row.y))) continue;
+      seen.add(ref+"@"+Math.round(row.y));
+
+      // Position approx : premier fragment proche du début E-
+      let posItem = row.items.find(i => String(i.s).includes("E")) || row.items[0];
+      // mieux : cherche un groupe qui contient le numéro
+      const num = ref.match(/\d{3}/)?.[0];
+      if(num){
+        const nitem = row.items.find(i => String(i.s).includes(num));
+        if(nitem) posItem = nitem;
+      }
+      found.push({page:pageNum, ref, x:posItem.x, y:row.y, text:ref});
+    }
+  }
+
+  // Dernier secours : chaque ligne avec espaces
+  if(!found.length){
+    for(const row of rows){
+      row.items.sort((a,b)=>a.x-b.x);
+      const line = row.items.map(i=>i.s).join(" ");
+      const matches = [...line.matchAll(/E\s*-\s*[A-Z]{1,2}\s*-\s*\d{3}\s*[A-Z]?/gi)];
+      for(const m of matches){
+        const ref = normRef(m[0]);
+        found.push({page:pageNum, ref, x:row.items[0].x, y:row.y, text:ref});
+      }
+    }
+  }
+
+  return found;
+}
+
 async function renderPdf(){
   const viewer = document.getElementById("viewerWrap");
   viewer.innerHTML = "";
@@ -142,22 +226,17 @@ async function renderPdf(){
 
     await page.render({canvasContext: canvas.getContext("2d"), viewport}).promise;
 
-    const textContent = await page.getTextContent();
-    for(const item of textContent.items){
-      const txt = String(item.str || "").trim();
-      if(!/^E-[A-Z]{1,2}-\d{3}[A-Z]?$/i.test(txt)) continue;
-      const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-      const x = tx[4], y = tx[5];
-      const ref = normRef(txt);
-      let rack = rackMap.get(ref);
-      if(!rack){ for(const v of baseRefVariants(ref)){ if(rackMap.has(v)){ rack = rackMap.get(v); break; } } }
-      extractedTags.push({page:p, ref, rack:rack || null, x, y, text:txt});
+    const tags = await extractWallRefs(page, viewport, p);
+    for(const tag of tags){
+      const rack = findRack(tag.ref);
+      tag.rack = rack || null;
+      extractedTags.push(tag);
 
       const d = document.createElement("div");
       d.className = "tag";
-      d.textContent = rack ? `${txt} · R${rack}` : txt;
-      d.style.left = x + "px";
-      d.style.top = (y-10) + "px";
+      d.textContent = rack ? `${tag.text} · R${rack}` : tag.text;
+      d.style.left = tag.x + "px";
+      d.style.top = (tag.y-10) + "px";
       if(rack){ d.style.background = colors[rack] || "#e5e7eb"; }
       else{ d.style.background = "#fff"; d.style.borderColor = "#9ca3af"; d.style.opacity = .65; }
       box.appendChild(d);
